@@ -1,0 +1,71 @@
+# Release 를 발행하면 그 설치 파일을 위즈셀러 허브에 등록한다.
+#
+# 빌드는 하지 않는다. 설치 파일은 개발 PC 에서 서명 빌드해 이 저장소 Release 에 올린다.
+# 이 작업은 Release 자산의 주소·서명·SHA-256·크기만 허브에 알린다. 운영 PC 의 앱은 허브에서 새 판을
+# 확인하고 이 Release 에서 파일을 받는다. 같은 판을 다시 보내면 허브가 409 로 답하며, 이미 등록된 것으로 본다.
+name: Publish to hub
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "다시 등록할 Release 태그 (예: v0.8.11)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-hub-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      HUB_URL: https://wwizseller.kr
+    steps:
+      - name: Release 자산 받기
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] || { echo "::error::태그 형식이 아닙니다: $TAG"; exit 1; }
+          VERSION="${TAG#v}"
+          FILE="WWIZSELLER_${VERSION}_x64-setup.exe"
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p "$FILE" -p "$FILE.sig" -D assets
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "FILE=$FILE" >> "$GITHUB_ENV"
+
+      - name: 허브에 등록
+        env:
+          HUB_RELEASE_TOKEN: ${{ secrets.HUB_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -n "$HUB_RELEASE_TOKEN" ] || { echo "::error::HUB_RELEASE_TOKEN 비밀이 없습니다"; exit 1; }
+          NOTES=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json body --jq .body)
+          jq -n \
+            --arg version "$VERSION" \
+            --arg notes "$NOTES" \
+            --arg signature "$(cat "assets/$FILE.sig")" \
+            --arg sha256 "$(sha256sum "assets/$FILE" | cut -d' ' -f1)" \
+            --argjson size "$(stat -c %s "assets/$FILE")" \
+            --arg url "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$FILE" \
+            '{version: $version, channel: "stable", target: "windows", arch: "x86_64", notes: $notes,
+              signature: $signature, sha256: $sha256, size: $size, asset_url: $url}' > body.json
+          STATUS=$(curl -sS -o response.json -w '%{http_code}' -X POST "$HUB_URL/hub/api/v1/releases" \
+            -H "Authorization: Bearer $HUB_RELEASE_TOKEN" -H 'Content-Type: application/json' --data @body.json)
+          jq -c '{success, message, code: .error.code, data}' response.json || cat response.json
+          case "$STATUS" in
+            201) echo "허브에 $VERSION 을 등록했습니다." ;;
+            409) echo "::notice::허브에 $VERSION 이 이미 있습니다." ;;
+            *) echo "::error::허브 등록 실패 (HTTP $STATUS)"; exit 1 ;;
+          esac
+
+      - name: 업데이트 응답 확인
+        run: |
+          set -euo pipefail
+          curl -sS "$HUB_URL/hub/api/v1/releases/latest?target=windows&arch=x86_64" | jq -c '.data | {latest_version, download_url, sha256}'
